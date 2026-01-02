@@ -153,6 +153,15 @@ TRACEPOINT_PROBE(syscalls, sys_exit_sendmsg) {
         }
     }
     
+    start_times.delete(&pid_tgid);
+    return 0;
+}
+"""
+
+# ============================================================================
+# PYTHON USERSPACE CODE
+# ============================================================================
+
 # Python structure matching the kernel's event_t struct
 # ctypes allows us to parse binary data from the kernel
 class Event(ct.Structure):
@@ -164,32 +173,11 @@ class Event(ct.Structure):
         ("size", ct.c_ulonglong),        # Bytes transferred
     ]
 
-class SimpleProfiler:ure):
-    _fields_ = [
-        ("ts", ct.c_ulonglong),
-        ("pid", ct.c_uint),
-        ("type", ct.c_uint),
-        ("duration_ns", ct.c_ulonglong),
-        ("size", ct.c_ulonglong),
-    ]
-
 class SimpleProfiler:
-    """Main profiler class - manages BPF program lifecycle and data collection.
-    
-    This class:
-    1. Compiles and loads the BPF program into the kernel
-    2. Attaches event callbacks to receive data from kernel
-    3. Aggregates statistics over the monitoring period
-    4. Generates a human-readable report
-    """
+    """Main profiler class that manages BPF program lifecycle and data collection."""
     
     def __init__(self, target_pid=None, duration=10):
-        """Initialize the profiler.
-        
-        Args:
-            target_pid: Optional PID to monitor (None = monitor all processes)
-            duration: How long to monitor in seconds
-        """
+        """Initialize the profiler with optional PID filter and duration."""
         self.target_pid = target_pid
         self.duration = duration
         self.start_time = None
@@ -216,17 +204,7 @@ class SimpleProfiler:
             sys.exit(1)
     
     def event_callback(self, cpu, data, size):
-        """Callback invoked when kernel sends an event via perf buffer.
-        
-        This is called for "interesting" events:
-        - Disk reads >10ms (potential bottleneck)
-        - Network sends >1MB (gradient sync, NCCL communication)
-        
-        Args:
-            cpu: Which CPU core generated the event
-            data: Binary event data from kernel
-            size: Size of the event structure
-        """
+        """Process events from kernel perf buffer for slow reads and large network transfers."""
         # Parse binary data into Python Event object
         event = ct.cast(data, ct.POINTER(Event)).contents
         
@@ -243,15 +221,11 @@ class SimpleProfiler:
             print(f"[DISK] PID {event.pid} - {size_mb:.2f} MB in {duration_ms:.2f}ms")
         elif event.type == 2:  # Network send event
             self.stats['large_sends'].append((event.pid, duration_ms, size_mb))
-            throughput = size_mb / (duration_ms / 1000) if duration_ms > 0 else 0
-            print(f"[NETWORK] PID {event.pid} - {size_mb:.2f} MB in {duration_ms:.2f}ms ({throughput:.2f} MB/s)")
+            throughput_mbps = size_mb / (duration_ms / 1000) if duration_ms > 0 else 0
+            print(f"[NETWORK] PID {event.pid} - {size_mb:.2f} MB in {duration_ms:.2f}ms ({throughput_mbps:.2f} MB/s)")
     
     def collect_stats(self):
-        """Read aggregated statistics from BPF hash maps.
-        
-        BPF maps accumulate totals in the kernel. We read them once at the end
-        to get final statistics without slowing down the monitored process.
-        """
+        """Read aggregated statistics from BPF hash maps in the kernel."""
         # Read total bytes read per process from kernel hash map
         for k, v in self.b["read_bytes"].items():
             self.stats['read_bytes'][k.value] = v.value
@@ -261,13 +235,7 @@ class SimpleProfiler:
             self.stats['send_bytes'][k.value] = v.value
     
     def run(self):
-        """Main monitoring loop.
-        
-        1. Opens perf buffer to receive events from kernel
-        2. Polls for events every second
-        3. Collects final statistics
-        4. Generates report
-        """
+        """Main monitoring loop that polls for events and generates the final report."""
         self.start_time = time.time()
         
         # Register callback to handle events from kernel
@@ -289,13 +257,7 @@ class SimpleProfiler:
         self.print_report()
     
     def print_report(self):
-        """Generate human-readable profiling report.
-        
-        Shows:
-        - Total disk I/O and throughput
-        - Network transfer statistics
-        - Bottleneck identification (slow reads, large transfers)
-        """
+        """Generate and print human-readable profiling report with disk and network statistics."""
         elapsed = time.time() - self.start_time
         
         print("\n" + "="*70)
@@ -312,7 +274,7 @@ class SimpleProfiler:
             throughput = read_mb / elapsed
             print(f"Total data read: {read_mb:.2f} MB")
             print(f"Throughput: {throughput:.2f} MB/s")
-            print(f"Slow reads (>10ms): {len(self.stats['slow_reads'])}")
+            print(f"Slow reads (over 10ms): {len(self.stats['slow_reads'])}")
             
             if self.stats['slow_reads']:
                 durations = [d for _, d, _ in self.stats['slow_reads']]
@@ -330,17 +292,20 @@ class SimpleProfiler:
             sent_mb = total_sent / (1024 * 1024)
             throughput = sent_mb / elapsed
             print(f"Data sent: {sent_mb:.2f} MB ({throughput:.2f} MB/s)")
-            print(f"Large transfers (>1MB): {len(self.stats['large_sends'])}")
+            print(f"Large transfers (over 1MB): {len(self.stats['large_sends'])}")
             
             if self.stats['large_sends']:
                 durations = [d for _, d, _ in self.stats['large_sends']]
+                avg_duration = sum(durations) / len(durations)
+                print(f"Avg transfer latency: {avg_duration:.2f}ms")
+        else:
+            print("No large network transfers detected")
+        print()
+        
+        print("="*70)
+
 def main():
-    """Entry point - parses arguments and runs profiler.
-    
-    Usage:
-        sudo python3 gpu_training_profiler.py -d 60              # Monitor all processes for 60s
-        sudo python3 gpu_training_profiler.py -p 1234 -d 30     # Monitor PID 1234 for 30s
-    """
+    """Command-line entry point for the profiler."""
     parser = argparse.ArgumentParser(
         description="eBPF-based profiler for ML training workloads",
         epilog="Example: sudo python3 gpu_training_profiler.py -d 60"
@@ -360,14 +325,6 @@ def main():
         sys.exit(1)
     
     # Create profiler instance and start monitoring
-    profiler = SimpleProfiler(target_pid=args.pid, duration=args.duration)
-    profiler.run()
-
-if __name__ == "__main__":
-    main()int("ERROR: This script requires root privileges")
-        print("Please run with: sudo python3 gpu_profiler_simple.py")
-        sys.exit(1)
-    
     profiler = SimpleProfiler(target_pid=args.pid, duration=args.duration)
     profiler.run()
 
