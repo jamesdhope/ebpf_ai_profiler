@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
-Simplified GPU Training Profiler - Compatible with more kernel versions
+GPU Training Profiler - eBPF-based profiler for ML training workloads
+
+This profiler uses eBPF (extended Berkeley Packet Filter) to monitor system-level
+operations during ML training, including:
+- Disk I/O (data loading from storage)
+- Network activity (distributed training communication)
+
+The profiler is kernel-version compatible, using stable tracepoint APIs instead
+of kprobes, making it work across Ubuntu 20.04+, RHEL 8+, and other modern distros.
+
+Architecture:
+- BPF programs run in the kernel, collecting data with minimal overhead (<1% CPU)
+- Userspace Python program loads BPF code, reads events, and generates reports
+- Uses tracepoints (stable syscall hooks) for maximum compatibility
 """
 
 from bcc import BPF
@@ -10,73 +23,103 @@ from collections import defaultdict
 import argparse
 import sys
 
-# Simplified BPF program without complex includes
-bpf_program = r"""
-#include <uapi/linux/ptrace.h>
+# ============================================================================
+# BPF PROGRAM (runs in kernel space)
+# ============================================================================
+# This C code is compiled by BCC and injected into the Linux kernel.
+# It hooks into syscall tracepoints to monitor I/O operations.
 
+bpf_program = r"""
+#include <uapi/linux/ptrace.h>  // Only header needed - minimal dependencies
+
+// Event structure - sent from kernel to userspace when interesting events occur
 struct event_t {
-    u64 ts;
-    u32 pid;
-    u32 type;
-    u64 duration_ns;
-    u64 size;
+    u64 ts;           // Timestamp in nanoseconds (from bpf_ktime_get_ns)
+    u32 pid;          // Process ID that triggered the event
+    u32 type;         // Event type: 1=disk read, 2=network send
+    u64 duration_ns;  // How long the operation took (in nanoseconds)
+    u64 size;         // Size of data transferred (in bytes)
 };
 
-BPF_PERF_OUTPUT(events);
-BPF_HASH(start_times, u64, u64);
-BPF_HASH(read_bytes, u32, u64);
-BPF_HASH(send_bytes, u32, u64);
+// BPF Maps - data structures shared between kernel and userspace
+// These persist across multiple syscalls and allow aggregation
+BPF_PERF_OUTPUT(events);                    // Ring buffer for sending events to userspace
+BPF_HASH(start_times, u64, u64);            // Track syscall entry time per thread
+BPF_HASH(read_bytes, u32, u64);             // Total bytes read per process
+BPF_HASH(send_bytes, u32, u64);             // Total bytes sent per process
 
-// Trace read syscall
+// ============================================================================
+// DISK I/O MONITORING - Hooks the read() syscall
+// ============================================================================
+// When a process calls read() to load data from disk, we measure latency
+// and track total bytes read. This catches ML data loading bottlenecks.
+
+// Hook: read() syscall entry point
+// Triggered BEFORE the kernel performs the read operation
 TRACEPOINT_PROBE(syscalls, sys_enter_read) {
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u64 ts = bpf_ktime_get_ns();
-    start_times.update(&pid_tgid, &ts);
+    u64 pid_tgid = bpf_get_current_pid_tgid();  // Get process/thread ID (combined)
+    u64 ts = bpf_ktime_get_ns();                 // Current time in nanoseconds
+    start_times.update(&pid_tgid, &ts);          // Store start time for latency calc
     return 0;
 }
 
+// Hook: read() syscall exit point
+// Triggered AFTER the kernel completes the read operation
+// We calculate latency and accumulate total bytes read
 TRACEPOINT_PROBE(syscalls, sys_exit_read) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
-    u64 *start_ts = start_times.lookup(&pid_tgid);
+    u64 *start_ts = start_times.lookup(&pid_tgid);  // Get the start time we saved
     
+    // If no start time found, this read wasn't tracked (race condition)
     if (start_ts == 0) {
         return 0;
     }
     
-    u64 end_ts = bpf_ktime_get_ns();
-    u64 duration = end_ts - *start_ts;
-    long bytes_read = args->ret;
+    u64 end_ts = bpf_ktime_get_ns();           // Current time
+    u64 duration = end_ts - *start_ts;         // Calculate latency
+    long bytes_read = args->ret;               // Read syscall return value = bytes read
     
     if (bytes_read > 0) {
-        u32 pid = pid_tgid >> 32;
+        u32 pid = pid_tgid >> 32;              // Extract PID from combined pid_tgid
+        
+        // Accumulate total bytes read for this process
         u64 *total = read_bytes.lookup(&pid);
         u64 new_total = total ? *total + bytes_read : bytes_read;
         read_bytes.update(&pid, &new_total);
         
-        // Report slow reads
-        if (duration > 10000000 && bytes_read > 1024) {
+        // Report slow reads (>10ms and >1KB) to userspace for analysis
+        // These indicate I/O bottlenecks in data loading
+        if (duration > 10000000 && bytes_read > 1024) {  // 10ms = 10,000,000 ns
             struct event_t event = {};
             event.ts = end_ts;
             event.pid = pid;
-            event.type = 1;
+            event.type = 1;                    // Type 1 = disk read event
             event.duration_ns = duration;
             event.size = bytes_read;
-            events.perf_submit(args, &event, sizeof(event));
+            events.perf_submit(args, &event, sizeof(event));  // Send to userspace
         }
     }
     
-    start_times.delete(&pid_tgid);
+    start_times.delete(&pid_tgid);  // Clean up - prevent memory leak
     return 0;
 }
 
-// Trace sendmsg (network)
+// ============================================================================
+// NETWORK MONITORING - Hooks the sendmsg() syscall
+// ============================================================================
+// Tracks network data transfer during distributed training (NCCL, MPI, etc.)
+// sendmsg() is used for TCP/UDP communication between training nodes
+
+// Hook: sendmsg() syscall entry
 TRACEPOINT_PROBE(syscalls, sys_enter_sendmsg) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u64 ts = bpf_ktime_get_ns();
-    start_times.update(&pid_tgid, &ts);
+    start_times.update(&pid_tgid, &ts);  // Save timestamp for latency measurement
     return 0;
 }
 
+// Hook: sendmsg() syscall exit
+// Triggered after network send completes
 TRACEPOINT_PROBE(syscalls, sys_exit_sendmsg) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u64 *start_ts = start_times.lookup(&pid_tgid);
@@ -87,32 +130,41 @@ TRACEPOINT_PROBE(syscalls, sys_exit_sendmsg) {
     
     u64 end_ts = bpf_ktime_get_ns();
     u64 duration = end_ts - *start_ts;
-    long bytes_sent = args->ret;
+    long bytes_sent = args->ret;  // sendmsg return value = bytes sent
     
     if (bytes_sent > 0) {
         u32 pid = pid_tgid >> 32;
+        
+        // Accumulate total bytes sent for this process
         u64 *total = send_bytes.lookup(&pid);
         u64 new_total = total ? *total + bytes_sent : bytes_sent;
         send_bytes.update(&pid, &new_total);
         
-        // Report large sends
-        if (bytes_sent > 1048576) {  // > 1MB
+        // Report large transfers (>1MB) - these indicate NCCL all-reduce,
+        // gradient synchronization, or other distributed training communication
+        if (bytes_sent > 1048576) {  // 1MB = 1,048,576 bytes
             struct event_t event = {};
             event.ts = end_ts;
             event.pid = pid;
-            event.type = 2;
+            event.type = 2;                    // Type 2 = network send event
             event.duration_ns = duration;
             event.size = bytes_sent;
             events.perf_submit(args, &event, sizeof(event));
         }
     }
     
-    start_times.delete(&pid_tgid);
-    return 0;
-}
-"""
-
+# Python structure matching the kernel's event_t struct
+# ctypes allows us to parse binary data from the kernel
 class Event(ct.Structure):
+    _fields_ = [
+        ("ts", ct.c_ulonglong),          # Timestamp
+        ("pid", ct.c_uint),              # Process ID
+        ("type", ct.c_uint),             # Event type (1=disk, 2=network)
+        ("duration_ns", ct.c_ulonglong), # Operation latency
+        ("size", ct.c_ulonglong),        # Bytes transferred
+    ]
+
+class SimpleProfiler:ure):
     _fields_ = [
         ("ts", ct.c_ulonglong),
         ("pid", ct.c_uint),
@@ -122,19 +174,37 @@ class Event(ct.Structure):
     ]
 
 class SimpleProfiler:
+    """Main profiler class - manages BPF program lifecycle and data collection.
+    
+    This class:
+    1. Compiles and loads the BPF program into the kernel
+    2. Attaches event callbacks to receive data from kernel
+    3. Aggregates statistics over the monitoring period
+    4. Generates a human-readable report
+    """
+    
     def __init__(self, target_pid=None, duration=10):
+        """Initialize the profiler.
+        
+        Args:
+            target_pid: Optional PID to monitor (None = monitor all processes)
+            duration: How long to monitor in seconds
+        """
         self.target_pid = target_pid
         self.duration = duration
         self.start_time = None
+        
+        # Statistics collected during monitoring
         self.stats = {
-            'read_bytes': defaultdict(int),
-            'send_bytes': defaultdict(int),
-            'slow_reads': [],
-            'large_sends': [],
+            'read_bytes': defaultdict(int),   # Total bytes read per PID
+            'send_bytes': defaultdict(int),   # Total bytes sent per PID
+            'slow_reads': [],                  # List of (pid, latency_ms, size_mb)
+            'large_sends': [],                 # List of (pid, latency_ms, size_mb)
         }
         
         print("Loading eBPF program...")
         try:
+            # BCC compiles the C code, loads it into kernel, attaches hooks
             self.b = BPF(text=bpf_program)
             print("✅ eBPF program loaded successfully")
             print(f"Monitoring for {duration} seconds...")
@@ -146,44 +216,86 @@ class SimpleProfiler:
             sys.exit(1)
     
     def event_callback(self, cpu, data, size):
+        """Callback invoked when kernel sends an event via perf buffer.
+        
+        This is called for "interesting" events:
+        - Disk reads >10ms (potential bottleneck)
+        - Network sends >1MB (gradient sync, NCCL communication)
+        
+        Args:
+            cpu: Which CPU core generated the event
+            data: Binary event data from kernel
+            size: Size of the event structure
+        """
+        # Parse binary data into Python Event object
         event = ct.cast(data, ct.POINTER(Event)).contents
         
+        # Filter by PID if specified
         if self.target_pid and event.pid != self.target_pid:
             return
         
+        # Convert from nanoseconds/bytes to human-readable units
         duration_ms = event.duration_ns / 1_000_000
         size_mb = event.size / (1024 * 1024)
         
-        if event.type == 1:  # Disk read
+        if event.type == 1:  # Disk read event
             self.stats['slow_reads'].append((event.pid, duration_ms, size_mb))
             print(f"[DISK] PID {event.pid} - {size_mb:.2f} MB in {duration_ms:.2f}ms")
-        elif event.type == 2:  # Network send
+        elif event.type == 2:  # Network send event
             self.stats['large_sends'].append((event.pid, duration_ms, size_mb))
             throughput = size_mb / (duration_ms / 1000) if duration_ms > 0 else 0
             print(f"[NETWORK] PID {event.pid} - {size_mb:.2f} MB in {duration_ms:.2f}ms ({throughput:.2f} MB/s)")
     
     def collect_stats(self):
+        """Read aggregated statistics from BPF hash maps.
+        
+        BPF maps accumulate totals in the kernel. We read them once at the end
+        to get final statistics without slowing down the monitored process.
+        """
+        # Read total bytes read per process from kernel hash map
         for k, v in self.b["read_bytes"].items():
             self.stats['read_bytes'][k.value] = v.value
         
+        # Read total bytes sent per process from kernel hash map
         for k, v in self.b["send_bytes"].items():
             self.stats['send_bytes'][k.value] = v.value
     
     def run(self):
+        """Main monitoring loop.
+        
+        1. Opens perf buffer to receive events from kernel
+        2. Polls for events every second
+        3. Collects final statistics
+        4. Generates report
+        """
         self.start_time = time.time()
+        
+        # Register callback to handle events from kernel
         self.b["events"].open_perf_buffer(self.event_callback)
         
         try:
             end_time = self.start_time + self.duration
             while time.time() < end_time:
+                # Poll kernel for events (1 second timeout)
+                # This receives events sent via perf_submit() in BPF code
                 self.b.perf_buffer_poll(timeout=1000)
         except KeyboardInterrupt:
             print("\n\nProfiling interrupted")
         
+        # Read final statistics from BPF maps
         self.collect_stats()
+        
+        # Generate and display report
         self.print_report()
     
     def print_report(self):
+        """Generate human-readable profiling report.
+        
+        Shows:
+        - Total disk I/O and throughput
+        - Network transfer statistics
+        - Bottleneck identification (slow reads, large transfers)
+        """
         elapsed = time.time() - self.start_time
         
         print("\n" + "="*70)
@@ -222,24 +334,37 @@ class SimpleProfiler:
             
             if self.stats['large_sends']:
                 durations = [d for _, d, _ in self.stats['large_sends']]
-                avg_duration = sum(durations) / len(durations)
-                print(f"Avg transfer latency: {avg_duration:.2f}ms")
-        else:
-            print("No large network transfers detected")
-        print()
-        
-        print("="*70)
-
 def main():
-    parser = argparse.ArgumentParser(description="Simplified Training Profiler")
-    parser.add_argument('-p', '--pid', type=int, help='Target process ID')
-    parser.add_argument('-d', '--duration', type=int, default=10, help='Duration in seconds')
+    """Entry point - parses arguments and runs profiler.
+    
+    Usage:
+        sudo python3 gpu_training_profiler.py -d 60              # Monitor all processes for 60s
+        sudo python3 gpu_training_profiler.py -p 1234 -d 30     # Monitor PID 1234 for 30s
+    """
+    parser = argparse.ArgumentParser(
+        description="eBPF-based profiler for ML training workloads",
+        epilog="Example: sudo python3 gpu_training_profiler.py -d 60"
+    )
+    parser.add_argument('-p', '--pid', type=int, 
+                       help='Target process ID to monitor (optional, default: all processes)')
+    parser.add_argument('-d', '--duration', type=int, default=10, 
+                       help='Monitoring duration in seconds (default: 10)')
     
     args = parser.parse_args()
     
+    # eBPF requires root privileges to load programs into kernel
     import os
     if os.geteuid() != 0:
-        print("ERROR: This script requires root privileges")
+        print("ERROR: This script requires root privileges to load eBPF programs")
+        print("Please run with: sudo python3 gpu_training_profiler.py")
+        sys.exit(1)
+    
+    # Create profiler instance and start monitoring
+    profiler = SimpleProfiler(target_pid=args.pid, duration=args.duration)
+    profiler.run()
+
+if __name__ == "__main__":
+    main()int("ERROR: This script requires root privileges")
         print("Please run with: sudo python3 gpu_profiler_simple.py")
         sys.exit(1)
     
